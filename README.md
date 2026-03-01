@@ -61,9 +61,9 @@ cargo run --release --bin fin_rust_app -- <inbound.xlsx> <stock.xlsx> <outbound.
 ## 5. 입력 파일 규칙
 - Excel 확장자: `.xlsx`, `.xlsm`, `.xls`
 - 파일명에서 종류 판별:
-  - `inbound` 또는 `2` 포함 -> 입고
-  - `stock` 또는 `3` 포함 -> 재고
-  - `outbound` 또는 `4` 포함 -> 출고
+  - `입고` 또는 `inbound` 포함 -> 입고
+  - `재고` 또는 `stock` 포함 -> 재고
+  - `출고` 또는 `outbound` 포함 -> 출고
 
 운영 시에는 각 종류별 최신 파일 1개씩 사용합니다.
 

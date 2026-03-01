@@ -31,7 +31,7 @@ app/
 1. `input`에서 최신 Excel 3종 탐지 (입고/재고/출고)
 2. 행 단위 raw 컬럼 보존 + 파트 키(`품명||부품번호`) 기준 집계
 3. `stock_in_out_monthly.json` 생성
-4. 문서 초안 row 생성
+4. 문서 row 생성
 5. DOCX 템플릿 placeholder 치환 후 파일 생성
 6. 배치 로그/리포트 기록
 
@@ -48,19 +48,14 @@ cargo run --release --bin fin_rust_app -- --workdir ./DB --once
 cargo run --release --bin fin_rust_app -- --workdir ./DB
 ```
 
-### 4.3 레거시 모드 (파일 직접 지정)
+### 4.3 1회 배치 + 스모크 출력 ON (선택)
+```powershell
+cargo run --release --bin fin_rust_app -- --workdir ./DB --once --smoke
+```
+
+### 4.4 레거시 모드 (파일 직접 지정)
 ```powershell
 cargo run --release --bin fin_rust_app -- <inbound.xlsx> <stock.xlsx> <outbound.xlsx> <out.json>
-```
-
-### 4.4 문서 초안만 생성
-```powershell
-cargo run --release --bin doc_writer -- --input ./DB/output/stock_in_out_monthly.json --outdir ./DB/output
-```
-
-### 4.5 DOCX만 생성
-```powershell
-cargo run --release --bin docx_writer -- --draft <draft.json> --template <template.docx> --outdir ./DB/output --limit 10
 ```
 
 ## 5. 입력 파일 규칙
@@ -74,9 +69,8 @@ cargo run --release --bin docx_writer -- --draft <draft.json> --template <templa
 
 ## 6. 주요 산출물
 - `DB/output/stock_in_out_monthly.json`
-- `DB/output/document_draft_*.json`
 - `DB/output/<YYYY-MM-DD>/기안문_(부품명...).docx`
-- `DB/output/docx_smoke_test_*.txt`
+- `DB/output/docx_smoke_test_*.txt` (`--smoke` 옵션 사용 시)
 - `DB/logs/workflow.log`
 - `DB/logs/batch_report_*.json`
 

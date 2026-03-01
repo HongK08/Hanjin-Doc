@@ -582,24 +582,13 @@ fn detect_kind_from_filename(path: &Path) -> Option<DocKind> {
     let name = raw.to_ascii_lowercase();
 
     // Prefer explicit filename markers/keywords before loose number matching.
-    if raw.contains("첨부파일4") || raw.contains("출고") || name.contains("outbound") {
+    if raw.contains("출고") || name.contains("outbound") {
         return Some(DocKind::Outbound);
     }
-    if raw.contains("첨부파일3") || raw.contains("재고") || name.contains("stock") {
+    if raw.contains("재고") || name.contains("stock") {
         return Some(DocKind::Stock);
     }
-    if raw.contains("첨부파일2") || raw.contains("입고") || name.contains("inbound") {
-        return Some(DocKind::Inbound);
-    }
-
-    // Fallback for numeric-only naming.
-    if name.contains("4") {
-        return Some(DocKind::Outbound);
-    }
-    if name.contains("3") {
-        return Some(DocKind::Stock);
-    }
-    if name.contains("2") {
+    if raw.contains("입고") || name.contains("inbound") {
         return Some(DocKind::Inbound);
     }
     None

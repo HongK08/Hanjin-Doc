@@ -18,6 +18,7 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 struct AppConfig {
     workdir: PathBuf,
     once: bool,
+    smoke: bool,
     legacy: Option<LegacyArgs>,
 }
 
@@ -64,7 +65,7 @@ struct BatchArtifacts {
     out_json: PathBuf,
     snapshot_date: String,
     converted_parts: usize,
-    smoke_txt: PathBuf,
+    smoke_txt: Option<PathBuf>,
     docx_outdir: Option<PathBuf>,
     docx_generated: usize,
 }
@@ -234,14 +235,15 @@ fn main() -> Result<()> {
     write_log(
         &workspace,
         &format!(
-            "startup: input='{}', output='{}', logs='{}'",
+            "startup: input='{}', output='{}', logs='{}', smoke={}",
             workspace.input_dir.display(),
             workspace.output.display(),
-            workspace.logs.display()
+            workspace.logs.display(),
+            config.smoke
         ),
     );
 
-    match process_available_batch(&workspace)? {
+    match process_available_batch(&workspace, config.smoke)? {
         ProcessOutcome::Processed => {}
         ProcessOutcome::Idle { reason } => write_log(&workspace, &reason),
     }
@@ -262,7 +264,7 @@ fn main() -> Result<()> {
     // and enable the function implementation in the commented block near
     // `watch_loop`.
     // -----------------------------------------------------------------
-    watch_loop(&workspace)
+    watch_loop(&workspace, config.smoke)
 }
 
 impl AppConfig {
@@ -270,6 +272,7 @@ impl AppConfig {
         let args: Vec<String> = env::args().collect();
         let mut workdir = PathBuf::from("./DB");
         let mut once = false;
+        let mut smoke = false;
         let mut workdir_explicit = false;
         let mut positional = Vec::new();
 
@@ -286,6 +289,10 @@ impl AppConfig {
                 }
                 "--once" => {
                     once = true;
+                    i += 1;
+                }
+                "--smoke" => {
+                    smoke = true;
                     i += 1;
                 }
                 _ => {
@@ -324,6 +331,7 @@ impl AppConfig {
         Ok(Self {
             workdir,
             once,
+            smoke,
             legacy,
         })
     }
@@ -357,10 +365,10 @@ fn setup_workspace(root: &Path) -> Result<Workspace> {
     Ok(ws)
 }
 
-fn watch_loop(workspace: &Workspace) -> Result<()> {
+fn watch_loop(workspace: &Workspace, smoke_enabled: bool) -> Result<()> {
     let mut last_idle_reason: Option<String> = None;
     loop {
-        match process_available_batch(workspace) {
+        match process_available_batch(workspace, smoke_enabled) {
             Ok(ProcessOutcome::Processed) => {
                 last_idle_reason = None;
             }
@@ -378,7 +386,7 @@ fn watch_loop(workspace: &Workspace) -> Result<()> {
     }
 }
 
-fn process_available_batch(workspace: &Workspace) -> Result<ProcessOutcome> {
+fn process_available_batch(workspace: &Workspace, smoke_enabled: bool) -> Result<ProcessOutcome> {
     let batch = match detect_ready_batch(&workspace.input_dir)? {
         DetectResult::Ready(b) => b,
         DetectResult::MissingKinds(kinds) => {
@@ -431,13 +439,22 @@ fn process_available_batch(workspace: &Workspace) -> Result<ProcessOutcome> {
         error: None,
     };
 
-    match run_batch_pipeline(workspace, &batch.inbound, &batch.stock, &batch.outbound) {
+    match run_batch_pipeline(
+        workspace,
+        &batch.inbound,
+        &batch.stock,
+        &batch.outbound,
+        smoke_enabled,
+    ) {
         Ok(artifacts) => {
             report.snapshot_date = Some(artifacts.snapshot_date.clone());
             report.converted_parts = Some(artifacts.converted_parts);
             report.outputs = Some(BatchReportOutputs {
                 out_json: path_relative_to(&workspace.root, &artifacts.out_json),
-                docx_smoke_test: Some(path_relative_to(&workspace.root, &artifacts.smoke_txt)),
+                docx_smoke_test: artifacts
+                    .smoke_txt
+                    .as_ref()
+                    .map(|p| path_relative_to(&workspace.root, p)),
                 docx_output_dir: artifacts
                     .docx_outdir
                     .as_ref()
@@ -629,11 +646,16 @@ fn run_batch_pipeline(
     inbound_path: &Path,
     stock_path: &Path,
     outbound_path: &Path,
+    smoke_enabled: bool,
 ) -> Result<BatchArtifacts> {
     let snapshot = build_snapshot(inbound_path, stock_path, outbound_path)?;
     let out_json = workspace.output.join("stock_in_out_monthly.json");
     write_snapshot_json(&out_json, &snapshot)?;
-    let smoke_txt = write_docx_smoke_test(workspace, &snapshot)?;
+    let smoke_txt = if smoke_enabled {
+        Some(write_docx_smoke_test(workspace, &snapshot)?)
+    } else {
+        None
+    };
     let (docx_outdir, docx_generated) = generate_docx_from_snapshot(workspace, &snapshot)?;
 
     Ok(BatchArtifacts {
@@ -1463,7 +1485,7 @@ fn run_legacy_mode(args: &LegacyArgs) -> Result<()> {
     let temp_root = PathBuf::from(format!("./DB/legacy_tmp_{stamp}"));
     let workspace = setup_workspace(&temp_root)?;
 
-    let artifacts = run_batch_pipeline(&workspace, &args.inbound, &args.stock, &args.outbound)?;
+    let artifacts = run_batch_pipeline(&workspace, &args.inbound, &args.stock, &args.outbound, false)?;
 
     if let Some(parent) = args.out_json.parent() {
         if !parent.as_os_str().is_empty() {

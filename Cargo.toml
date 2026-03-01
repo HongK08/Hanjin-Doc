@@ -1,0 +1,13 @@
+﻿[package]
+name = "fin_rust_app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+calamine = "0.31"
+chrono = { version = "0.4", features = ["serde"] }
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zip = "2"

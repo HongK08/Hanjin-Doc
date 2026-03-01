@@ -1,0 +1,107 @@
+﻿{
+    "checked_at":  "2026-03-01 23:21:53",
+    "doc_dir":  "C:\\Users\\HongKi-Window\\Desktop\\FIN_RUST\\app\\DB\\output\\2026-03-01",
+    "snapshot_parts":  2159,
+    "actual_docx_files":  2113,
+    "missing_expected_count":  2,
+    "unexpected_file_count":  2,
+    "xml_open_error_count":  0,
+    "name_mismatch_count":  34,
+    "partno_mismatch_count":  26,
+    "stock_mismatch_count":  0,
+    "missing_expected_sample":  [
+                                    "기안문_(Ram Spreader Hose)_3_8_2W_2700.docx",
+                                    "기안문_(스냅링)_R52.docx"
+                                ],
+    "unexpected_file_sample":  [
+                                   "기안문_(Ram Spreader Hose)_¼_2W_1900.docx",
+                                   "기안문_(스냅링)_r_t30.docx"
+                               ],
+    "name_mismatch_sample":  [
+                                 {
+                                     "file":  "기안문_(ADVANCED CONTROL UNIT).docx",
+                                     "part_name":  "ADVANCED CONTROL UNIT"
+                                 },
+                                 {
+                                     "file":  "기안문_(ARMGC Trolley Wheel).docx",
+                                     "part_name":  "ARMGC Trolley Wheel"
+                                 },
+                                 {
+                                     "file":  "기안문_(AUXILIARY CONTACT BLOCK).docx",
+                                     "part_name":  "AUXILIARY CONTACT BLOCK"
+                                 },
+                                 {
+                                     "file":  "기안문_(Ball And Socket).docx",
+                                     "part_name":  "Ball And Socket"
+                                 },
+                                 {
+                                     "file":  "기안문_(Contactor).docx",
+                                     "part_name":  "Contactor"
+                                 },
+                                 {
+                                     "file":  "기안문_(Digital Input).docx",
+                                     "part_name":  "Digital Input"
+                                 },
+                                 {
+                                     "file":  "기안문_(DIGITAL I_O MODULE).docx",
+                                     "part_name":  "DIGITAL I/O MODULE"
+                                 },
+                                 {
+                                     "file":  "기안문_(drum\u0026hub ass\u0027y).docx",
+                                     "part_name":  "drum\u0026hub ass\u0027y"
+                                 },
+                                 {
+                                     "file":  "기안문_(Encoder \u0026 PWM module).docx",
+                                     "part_name":  "Encoder \u0026 PWM module"
+                                 },
+                                 {
+                                     "file":  "기안문_(FAN BELT).docx",
+                                     "part_name":  "FAN BELT"
+                                 }
+                             ],
+    "partno_mismatch_sample":  [
+                                   {
+                                       "file":  "기안문_(ADVANCED CONTROL UNIT).docx",
+                                       "part_no":  "LUCB18FU"
+                                   },
+                                   {
+                                       "file":  "기안문_(ARMGC Trolley Wheel).docx",
+                                       "part_no":  "2RMG-80-30-050"
+                                   },
+                                   {
+                                       "file":  "기안문_(AUXILIARY CONTACT BLOCK).docx",
+                                       "part_no":  "CA4-22M-W"
+                                   },
+                                   {
+                                       "file":  "기안문_(Ball And Socket).docx",
+                                       "part_no":  "000,602,5253"
+                                   },
+                                   {
+                                       "file":  "기안문_(Contactor).docx",
+                                       "part_no":  "AF26-30-00-13 100-250VAC/DC"
+                                   },
+                                   {
+                                       "file":  "기안문_(Digital Input).docx",
+                                       "part_no":  "DI581-S"
+                                   },
+                                   {
+                                       "file":  "기안문_(DIGITAL I_O MODULE).docx",
+                                       "part_no":  "DX522 D2"
+                                   },
+                                   {
+                                       "file":  "기안문_(FAN BELT).docx",
+                                       "part_no":  "923976.0330(VOLVO 3830067)"
+                                   },
+                                   {
+                                       "file":  "기안문_(FUSE).docx",
+                                       "part_no":  "170M6421 2000A 550V(PC33VD55V2000TF)"
+                                   },
+                                   {
+                                       "file":  "기안문_(GASCKET).docx",
+                                       "part_no":  "22505410"
+                                   }
+                               ],
+    "stock_mismatch_sample":  [
+
+                              ]
+}

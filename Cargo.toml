@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+regex = "1"
 anyhow = "1"
 calamine = "0.31"
 chrono = { version = "0.4", features = ["serde"] }

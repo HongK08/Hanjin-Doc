@@ -67,6 +67,13 @@ cargo run --release --bin fin_rust_app -- <inbound.xlsx> <stock.xlsx> <outbound.
 
 운영 시에는 각 종류별 최신 파일 1개씩 사용합니다.
 
+### DOCX 템플릿 파일명(고정)
+- `DB/input/한진_부품구매_요청_양식.docx` : 50만원 초과(>) 케이스
+- `DB/input/한진_부품구매_품의.docx` : 50만원 이하(<=) 케이스
+
+참고:
+- 현재 코드 기본값은 구매결정 V2가 `OFF`라서 템플릿 분기 로직은 준비만 된 상태입니다.
+
 ## 6. 주요 산출물
 - `DB/output/stock_in_out_monthly.json`
 - `DB/output/<YYYY-MM-DD>/기안문_(부품명...).docx`

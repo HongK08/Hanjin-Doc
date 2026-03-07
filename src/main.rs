@@ -1,8 +1,8 @@
-use anyhow::{bail, Context, Result};
+﻿use anyhow::{bail, Context, Result};
 use calamine::{open_workbook_auto, Data, Reader};
 use chrono::{Duration as ChronoDuration, Local, NaiveDate};
 use rayon::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
@@ -13,6 +13,19 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
+
+// 구매결정 V2 규칙(필수재고 30% + 단가 50만원 기준)
+// 현재는 기존 로직 유지 요청으로 비활성화 상태.
+const ENABLE_PURCHASE_DECISION_V2: bool = true;
+const DATE_PARSE_FORMATS: [&str; 5] = ["%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%-m/%-d/%Y", "%Y.%m.%d"];
+// 50만원 이상(>=) 템플릿(레거시): 부품 구매 요청 품의
+const TEMPLATE_OVER_500K_DOCX: &str = "한진_부품구매_요청_양식.docx";
+// 50만원 이상(>=) + 교체이력 있음
+const TEMPLATE_OVER_500K_WITH_HISTORY_DOCX: &str = "한진_부품구매요청_500K_초과_교체이력_유.docx";
+// 50만원 이상(>=) + 교체이력 없음
+const TEMPLATE_OVER_500K_WITHOUT_HISTORY_DOCX: &str = "한진_부품구매요청_500K_초과_교체이력_무.docx";
+// 50만원 이하(<=) 템플릿: 부품 구매 품의
+const TEMPLATE_UNDER_EQ_500K_DOCX: &str = "한진_부품구매_양식.docx";
 
 #[derive(Debug)]
 struct AppConfig {
@@ -152,16 +165,207 @@ struct DocumentRow {
     usage_reason: String,
     replacement_reason: String,
     current_stock_before: f64,
-    outbound_qty_sum: f64,
-    current_stock_updated: f64,
+    required_stock: Option<f64>,
+    purchase_qty: f64,
     purchase_order_note: String,
-    equipment_no: String,
-    model_name: String,
-    issued_date: String,
     issued_qty: String,
+    replacement_dates: [String; 6],
+    replacement_qtys: [String; 6],
+    replacement_hosts: [String; 6],
     vendor_name: String,
     unit: String,
     unit_price: String,
+    part_role: String,
+    template_kind: PurchaseTemplateKind,
+    has_replacement_history: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ReplacementEvent {
+    date_iso: String,
+    qty: String,
+    host: String,
+    row_idx: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PartFunctionRecord {
+    item_name: String,
+    description: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PartRoleIndex {
+    exact: HashMap<String, String>,
+    items: Vec<PartRoleItem>,
+    first_char_index: HashMap<char, Vec<usize>>,
+}
+
+#[derive(Debug, Clone)]
+struct PartRoleItem {
+    key: String,
+    role: String,
+    key_bigrams: HashSet<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PurchaseDecision {
+    should_purchase: bool,
+    note: String,
+    template_kind: PurchaseTemplateKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PurchaseTemplateKind {
+    Over500k,
+    UnderEq500k,
+}
+
+impl PartRoleIndex {
+    fn insert(&mut self, part_name: &str, role: &str) {
+        let key = normalize_match_key(part_name);
+        if key.is_empty() {
+            return;
+        }
+        self.exact.insert(key.clone(), role.to_string());
+        let idx = self.items.len();
+        if let Some(ch) = key.chars().next() {
+            self.first_char_index.entry(ch).or_default().push(idx);
+        }
+        self.items.push(PartRoleItem {
+            key_bigrams: bigram_set(&key),
+            key,
+            role: role.to_string(),
+        });
+    }
+
+    fn lookup(&self, part_name: &str) -> Option<String> {
+        let mut query = String::with_capacity(part_name.len());
+        normalize_match_key_into(part_name, &mut query);
+        if query.is_empty() {
+            return None;
+        }
+        if let Some(role) = self.exact.get(&query) {
+            return Some(role.clone());
+        }
+
+        let query_bigrams = bigram_set(&query);
+        let mut candidate_indices: Option<&[usize]> = None;
+        if let Some(ch) = query.chars().next() {
+            if let Some(indices) = self.first_char_index.get(&ch) {
+                candidate_indices = Some(indices.as_slice());
+            }
+        }
+
+        let mut best_score = 0.0f64;
+        let mut best_role: Option<&str> = None;
+        if let Some(indices) = candidate_indices {
+            for idx in indices {
+                let item = &self.items[*idx];
+                let mut score = jaccard_bigram_score_sets(&query_bigrams, &item.key_bigrams);
+                if item.key.starts_with(&query) || query.starts_with(&item.key) {
+                    score += 0.15;
+                }
+                if item.key.contains(&query) || query.contains(&item.key) {
+                    score += 0.10;
+                }
+                let prefix = common_prefix_len(&query, &item.key) as f64;
+                let base = query.len().max(item.key.len()) as f64;
+                if base > 0.0 {
+                    score += (prefix / base) * 0.10;
+                }
+                if score > best_score {
+                    best_score = score;
+                    best_role = Some(item.role.as_str());
+                }
+            }
+        } else {
+            for item in &self.items {
+                let mut score = jaccard_bigram_score_sets(&query_bigrams, &item.key_bigrams);
+                if item.key.starts_with(&query) || query.starts_with(&item.key) {
+                    score += 0.15;
+                }
+                if item.key.contains(&query) || query.contains(&item.key) {
+                    score += 0.10;
+                }
+                let prefix = common_prefix_len(&query, &item.key) as f64;
+                let base = query.len().max(item.key.len()) as f64;
+                if base > 0.0 {
+                    score += (prefix / base) * 0.10;
+                }
+                if score > best_score {
+                    best_score = score;
+                    best_role = Some(item.role.as_str());
+                }
+            }
+        }
+        // Temp_Setting
+        if best_score >= 0.30 {
+            return best_role.map(|v| v.to_string());
+        }
+        None
+    }
+}
+
+fn is_ignored_match_char(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            '-' | '_' | '(' | ')' | '[' | ']' | '{' | '}' | '.' | ',' | ':' | '/' | '\\' | '|'
+                | '\'' | '"' | '`' | '~' | '!' | '@' | '#' | '$' | '%' | '^' | '&' | '*' | '+'
+                | '=' | '?'
+        )
+}
+
+fn normalize_match_key_into(s: &str, out: &mut String) {
+    out.clear();
+    out.reserve(s.len());
+    for ch in s.chars() {
+        for lower in ch.to_lowercase() {
+            if !is_ignored_match_char(lower) {
+                out.push(lower);
+            }
+        }
+    }
+}
+
+fn normalize_match_key(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    normalize_match_key_into(s, &mut out);
+    out
+}
+
+fn jaccard_bigram_score_sets(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let inter = a.intersection(b).count() as f64;
+    let union = a.union(b).count() as f64;
+    if union == 0.0 {
+        0.0
+    } else {
+        inter / union
+    }
+}
+
+fn bigram_set(s: &str) -> HashSet<String> {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() < 2 {
+        return HashSet::new();
+    }
+    let mut out = HashSet::with_capacity(chars.len().saturating_sub(1));
+    for i in 0..chars.len() - 1 {
+        out.insert(format!("{}{}", chars[i], chars[i + 1]));
+    }
+    out
+}
+
+fn common_prefix_len(a: &str, b: &str) -> usize {
+    a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
+}
+
+fn is_effective_row(row: &[Data]) -> bool {
+    row.iter().any(|c| !matches!(c, Data::Empty))
 }
 
 #[derive(Clone)]
@@ -175,6 +379,16 @@ struct TemplateEntry {
 #[derive(Clone)]
 struct TemplatePackage {
     entries: Vec<TemplateEntry>,
+}
+
+#[derive(Clone)]
+struct NamedTemplatePackages {
+    over_500k_with_history: Arc<TemplatePackage>,
+    over_500k_without_history: Arc<TemplatePackage>,
+    under_eq_500k: Arc<TemplatePackage>,
+    over_500k_with_history_name: String,
+    over_500k_without_history_name: String,
+    under_eq_500k_name: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -571,6 +785,11 @@ fn collect_excel_candidates(source_dir: &Path) -> Result<Vec<CandidateFile>> {
 }
 
 fn is_excel_file(path: &Path) -> bool {
+    if let Some(name) = path.file_name().and_then(|v| v.to_str()) {
+        if name.starts_with("~$") {
+            return false;
+        }
+    }
     path.extension()
         .and_then(|v| v.to_str())
         .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "xlsx" | "xlsm" | "xls"))
@@ -885,27 +1104,35 @@ fn generate_docx_from_snapshot(
     workspace: &Workspace,
     snapshot: &Snapshot,
 ) -> Result<(Option<PathBuf>, usize)> {
-    let Some(template) = resolve_docx_template(workspace)? else {
-        write_log(workspace, "docx template not found; skipping docx generation");
+    let Some(templates) = resolve_docx_templates_by_name(workspace)? else {
+        write_log(workspace, "named docx templates not found; skipping docx generation");
         return Ok((None, 0));
     };
-    let template_pkg = Arc::new(load_template_package(&template)?);
 
-    let rows = build_document_rows(snapshot, true, None);
+    let part_roles = load_part_role_index(&workspace.input_dir)?;
+    let rows = build_document_rows(snapshot, true, None, part_roles.as_ref());
     let outdir = workspace
         .output
         .join(Local::now().format("%Y-%m-%d").to_string());
     fs::create_dir_all(&outdir)
         .with_context(|| format!("create docx outdir failed: {}", outdir.display()))?;
+    for dir in [
+        outdir.join("over_500k").join("history_yes"),
+        outdir.join("over_500k").join("history_no"),
+        outdir.join("under_eq_500k"),
+    ] {
+        fs::create_dir_all(&dir).with_context(|| format!("create dir failed: {}", dir.display()))?;
+    }
 
-    let targets = build_unique_docx_targets(&outdir, &rows);
+    let targets = build_unique_docx_targets_by_group(&outdir, &rows);
     let generated = AtomicUsize::new(0);
 
     rows.par_iter()
         .zip(targets.par_iter())
         .enumerate()
         .try_for_each(|(idx, (row, output))| -> Result<()> {
-            render_docx_from_package(&template_pkg, output, row, idx + 1)?;
+            let selected = select_template_for_row(row, &templates);
+            render_docx_from_package(selected, output, row, idx + 1)?;
             generated.fetch_add(1, Ordering::Relaxed);
             Ok(())
         })?;
@@ -913,46 +1140,102 @@ fn generate_docx_from_snapshot(
     write_log(
         workspace,
         &format!(
-            "docx generated: count={}, outdir='{}', template='{}'",
+            "docx generated: count={}, outdir='{}', split_dirs='over_500k/history_yes,over_500k/history_no,under_eq_500k', templates='over_hist_yes:{}','over_hist_no:{}','under_eq:{}'",
             generated.load(Ordering::Relaxed),
             outdir.display(),
-            template.display()
+            templates.over_500k_with_history_name,
+            templates.over_500k_without_history_name,
+            templates.under_eq_500k_name
         ),
     );
 
     Ok((Some(outdir), generated.load(Ordering::Relaxed)))
 }
 
-fn resolve_docx_template(workspace: &Workspace) -> Result<Option<PathBuf>> {
-    let mut candidates: Vec<PathBuf> = fs::read_dir(&workspace.input_dir)?
-        .filter_map(|e| e.ok().map(|v| v.path()))
-        .filter(|p| {
-            p.extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.eq_ignore_ascii_case("docx"))
-                .unwrap_or(false)
-        })
-        .collect();
+fn resolve_docx_templates_by_name(workspace: &Workspace) -> Result<Option<NamedTemplatePackages>> {
+    let over_500k_path = workspace.input_dir.join(TEMPLATE_OVER_500K_DOCX);
+    let over_500k_with_history_path = workspace.input_dir.join(TEMPLATE_OVER_500K_WITH_HISTORY_DOCX);
+    let over_500k_without_history_path = workspace
+        .input_dir
+        .join(TEMPLATE_OVER_500K_WITHOUT_HISTORY_DOCX);
 
-    candidates.sort_by(|a, b| {
-        let ma = fs::metadata(a)
-            .and_then(|m| m.modified())
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        let mb = fs::metadata(b)
-            .and_then(|m| m.modified())
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        mb.cmp(&ma)
-    });
+    let (over_500k_with_history_pkg, over_500k_with_history_name, over_500k_without_history_pkg, over_500k_without_history_name) =
+        if over_500k_with_history_path.exists() && over_500k_without_history_path.exists() {
+            (
+                Arc::new(load_template_package(&over_500k_with_history_path)?),
+                TEMPLATE_OVER_500K_WITH_HISTORY_DOCX.to_string(),
+                Arc::new(load_template_package(&over_500k_without_history_path)?),
+                TEMPLATE_OVER_500K_WITHOUT_HISTORY_DOCX.to_string(),
+            )
+        } else if over_500k_path.exists() {
+            write_log(
+                workspace,
+                &format!(
+                    "500k over history templates not fully found; fallback to legacy template '{}'",
+                    TEMPLATE_OVER_500K_DOCX
+                ),
+            );
+            let legacy = Arc::new(load_template_package(&over_500k_path)?);
+            (
+                legacy.clone(),
+                TEMPLATE_OVER_500K_DOCX.to_string(),
+                legacy,
+                TEMPLATE_OVER_500K_DOCX.to_string(),
+            )
+        } else {
+            return Ok(None);
+        };
 
-    if let Some(p) = candidates.first() {
-        return Ok(Some(p.clone()));
-    }
+    let under_eq_500k_path = workspace.input_dir.join(TEMPLATE_UNDER_EQ_500K_DOCX);
+    let (under_eq_500k_pkg, under_eq_500k_name) = if under_eq_500k_path.exists() {
+        (
+            Arc::new(load_template_package(&under_eq_500k_path)?),
+            TEMPLATE_UNDER_EQ_500K_DOCX.to_string(),
+        )
+    } else {
+        write_log(
+            workspace,
+            &format!(
+                "approval template '{}' not found; fallback to 500k-over(no-history) template",
+                TEMPLATE_UNDER_EQ_500K_DOCX
+            ),
+        );
+        (
+            over_500k_without_history_pkg.clone(),
+            over_500k_without_history_name.clone(),
+        )
+    };
 
-    Ok(None)
+    Ok(Some(NamedTemplatePackages {
+        over_500k_with_history: over_500k_with_history_pkg,
+        over_500k_without_history: over_500k_without_history_pkg,
+        under_eq_500k: under_eq_500k_pkg,
+        over_500k_with_history_name,
+        over_500k_without_history_name,
+        under_eq_500k_name,
+    }))
 }
 
-fn build_document_rows(snapshot: &Snapshot, include_no_outbound: bool, limit: Option<usize>) -> Vec<DocumentRow> {
-    let mut rows = Vec::new();
+fn select_template_for_row<'a>(row: &DocumentRow, templates: &'a NamedTemplatePackages) -> &'a TemplatePackage {
+    match row.template_kind {
+        PurchaseTemplateKind::Over500k => {
+            if row.has_replacement_history {
+                templates.over_500k_with_history.as_ref()
+            } else {
+                templates.over_500k_without_history.as_ref()
+            }
+        }
+        PurchaseTemplateKind::UnderEq500k => templates.under_eq_500k.as_ref(),
+    }
+}
+
+fn build_document_rows(
+    snapshot: &Snapshot,
+    include_no_outbound: bool,
+    limit: Option<usize>,
+    part_roles: Option<&PartRoleIndex>,
+) -> Vec<DocumentRow> {
+    let mut rows = Vec::with_capacity(snapshot.parts.len());
 
     for (part_key, part) in &snapshot.parts {
         if !include_no_outbound && part.outbound_count == 0 {
@@ -961,6 +1244,9 @@ fn build_document_rows(snapshot: &Snapshot, include_no_outbound: bool, limit: Op
 
         let part_no = fallback_missing_doc(part.part_no.clone());
         let part_name = fallback_missing_doc(Some(part.part_name.clone()));
+        let part_role = part_roles
+            .and_then(|idx| idx.lookup(&part_name))
+            .unwrap_or_else(|| "(직접입력)".to_string());
         let received_date = part
             .inbound_dates
             .first()
@@ -975,60 +1261,136 @@ fn build_document_rows(snapshot: &Snapshot, include_no_outbound: bool, limit: Op
         let mut used_where = "출고기록없음".to_string();
         let mut usage_reason = "출고기록없음".to_string();
         let mut replacement_reason = "출고기록없음".to_string();
-        let mut equipment_no = "기록없음".to_string();
-        let mut model_name = "기록없음".to_string();
-        let mut issued_date = used_date_last.clone();
         let mut issued_qty = format!("{:.0}", part.outbound_qty_sum);
+        let mut replacement_dates = [
+            "".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "".to_string(),
+        ];
+        let mut replacement_qtys = [
+            "".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "".to_string(),
+        ];
+        let mut replacement_hosts = [
+            "".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "".to_string(),
+        ];
         let mut unit = "기록없음".to_string();
         let mut vendor_name = "기록없음".to_string();
         let mut unit_price = "기록없음".to_string();
 
         if let Some(out_idx) = part.outbound_row_idx.last() {
             if let Some(row) = snapshot.raw.outbound_rows.get(*out_idx) {
-                used_where = pick_first_col(
-                    &row.columns,
-                    &["장비명", "장비번호", "주요장비명", "주요Model명"],
-                );
+                let equip_name = pick_first_col(&row.columns, &["장비명", "주요장비명"]);
+                let equip_no = pick_first_col(&row.columns, &["장비번호"]);
+                let model_fallback = pick_first_col(&row.columns, &["주요Model명", "Model명"]);
+                used_where = if equip_name != "기록없음" {
+                    equip_name
+                } else if equip_no != "기록없음" {
+                    equip_no
+                } else {
+                    model_fallback
+                };
                 usage_reason = pick_first_col(&row.columns, &["운영구분", "지급구분", "요청번호"]);
                 replacement_reason = pick_first_col(&row.columns, &["지급구분", "운영구분", "요청번호"]);
-                equipment_no = pick_first_col(&row.columns, &["장비번호"]);
-                model_name = pick_first_col(&row.columns, &["Model명"]);
                 issued_qty = pick_first_col(&row.columns, &["지급량"]);
-                issued_date = row
-                    .date_iso
-                    .clone()
-                    .unwrap_or_else(|| pick_first_col(&row.columns, &["지급일자"]));
-                unit = pick_first_col(&row.columns, &["단위"]);
-                unit_price = pick_first_col(&row.columns, &["단가", "구단가"]);
                 if let Some(d) = row.date_iso.clone() {
                     used_date_last = d;
                 }
             }
         }
 
-        if let Some(in_idx) = part.inbound_row_idx.first() {
+        let events = collect_replacement_events(snapshot, part);
+        let has_replacement_history = !events.is_empty();
+        if !events.is_empty() {
+            let latest = events.last().expect("events is non-empty");
+            used_date_last = latest.date_iso.clone();
+            // Fill both left/right history columns top-down: 1,4,2,5,3,6
+            let slot_order = [0usize, 3, 1, 4, 2, 5];
+            for (i, ev) in events.iter().take(6).enumerate() {
+                let slot = slot_order[i];
+                replacement_dates[slot] = ev.date_iso.clone();
+                replacement_qtys[slot] = ev.qty.clone();
+                replacement_hosts[slot] = ev.host.clone();
+            }
+        }
+
+        if let Some(in_idx) = part.inbound_row_idx.last() {
             if let Some(in_row) = snapshot.raw.inbound_rows.get(*in_idx) {
-                let v = pick_first_col(&in_row.columns, &["납품업체"]);
+                let v = pick_first_col(
+                    &in_row.columns,
+                    &["납품업체", "납품업체명", "거래처", "업체", "공급업체", "구매업체"],
+                );
                 if v != "기록없음" {
                     vendor_name = v;
                 }
-                if unit == "기록없음" {
-                    unit = pick_first_col(&in_row.columns, &["단위"]);
-                }
-                if unit_price == "기록없음" {
-                    unit_price = pick_first_col(&in_row.columns, &["단가", "구단가"]);
-                }
+                unit = pick_first_col(&in_row.columns, &["단위"]);
+                unit_price = pick_first_col(
+                    &in_row.columns,
+                    &["단가", "구단가", "재고금액(원)", "재고 금액(원)", "재고금액", "금액"],
+                );
             }
         }
 
         let current_stock_before = part.current_stock_before.unwrap_or(0.0);
         let current_stock_updated = part.current_stock_updated.unwrap_or(0.0);
-        let purchase_order_needed = current_stock_updated <= 0.0;
-        let purchase_order_note = if purchase_order_needed {
-            "재고 부족 가능성 확인 후 구매발주 검토".to_string()
+        let stock_row = part
+            .stock_row_idx
+            .first()
+            .and_then(|idx| snapshot.raw.stock_rows.get(*idx));
+        if let Some(row) = stock_row {
+            if is_missing_doc_value(&used_where) {
+                used_where = pick_first_col(&row.columns, &["주요장비명", "장비명", "재고번호"]);
+            }
+            if is_missing_doc_value(&vendor_name) {
+                vendor_name = pick_first_col(
+                    &row.columns,
+                    &["납품업체", "납품업체명", "거래처", "업체", "공급업체", "구매업체"],
+                );
+            }
+            if is_missing_doc_value(&unit) {
+                unit = pick_first_col(&row.columns, &["단위"]);
+            }
+            if is_missing_doc_value(&unit_price) {
+                unit_price = pick_first_col(
+                    &row.columns,
+                    &["재고금액(원)", "재고 금액(원)", "재고금액", "금액", "단가", "구단가"],
+                );
+            }
+        }
+        let required_stock = stock_row
+            .and_then(|row| {
+                let raw = pick_first_col(
+                    &row.columns,
+                    &["필수재고량", "필수 재고량", "최소재고", "min_stock", "safety_stock"],
+                );
+                parse_numeric_text(&raw)
+            });
+        let unit_price_value = parse_numeric_text(&unit_price);
+        let decision = if ENABLE_PURCHASE_DECISION_V2 {
+            decide_purchase_v2(required_stock, current_stock_before, unit_price_value)
         } else {
-            "현재 재고 유지".to_string()
+            decide_purchase_legacy(current_stock_updated)
         };
+        if ENABLE_PURCHASE_DECISION_V2 && !decision.should_purchase {
+            continue;
+        }
+        let purchase_order_note = decision.note;
+        let purchase_qty = required_stock
+            .map(|req| (req - current_stock_before).max(0.0))
+            .filter(|v| *v > 0.0)
+            .unwrap_or(1.0);
 
         rows.push(DocumentRow {
             part_key: part_key.clone(),
@@ -1040,16 +1402,19 @@ fn build_document_rows(snapshot: &Snapshot, include_no_outbound: bool, limit: Op
             usage_reason,
             replacement_reason,
             current_stock_before,
-            outbound_qty_sum: part.outbound_qty_sum,
-            current_stock_updated,
+            required_stock,
+            purchase_qty,
             purchase_order_note,
-            equipment_no,
-            model_name,
-            issued_date,
             issued_qty,
+            replacement_dates,
+            replacement_qtys,
+            replacement_hosts,
             vendor_name,
             unit,
             unit_price,
+            part_role,
+            template_kind: decision.template_kind,
+            has_replacement_history,
         });
     }
 
@@ -1060,7 +1425,71 @@ fn build_document_rows(snapshot: &Snapshot, include_no_outbound: bool, limit: Op
     rows
 }
 
+fn collect_replacement_events(snapshot: &Snapshot, part: &PartBlock) -> Vec<ReplacementEvent> {
+    let mut raw_events = Vec::new();
+    for idx in &part.outbound_row_idx {
+        if let Some(row) = snapshot.raw.outbound_rows.get(*idx) {
+            let date_iso = row
+                .date_iso
+                .clone()
+                .or_else(|| {
+                    let raw = pick_first_col(&row.columns, &["지급일자", "출고일자", "date"]);
+                    normalize_date_to_iso(&raw)
+                })
+                .unwrap_or_else(|| "0000-00-00".to_string());
+            let qty = row
+                .qty
+                .map(|v| format!("{:.0}", v))
+                .unwrap_or_else(|| {
+                    let raw = pick_first_col(&row.columns, &["지급량", "검수량", "qty"]);
+                    parse_numeric_text(&raw)
+                        .map(|n| format!("{:.0}", n))
+                        .unwrap_or_else(|| "0".to_string())
+                });
+            let host = pick_first_col(&row.columns, &["장비번호", "호기", "설비번호", "장비명", "주요장비명"]);
+            raw_events.push(ReplacementEvent {
+                date_iso,
+                qty,
+                host,
+                row_idx: *idx,
+            });
+        }
+    }
+
+    raw_events.sort_by(|a, b| match a.date_iso.cmp(&b.date_iso) {
+        std::cmp::Ordering::Equal => a.row_idx.cmp(&b.row_idx),
+        ord => ord,
+    });
+
+    // Quantity-based plotting:
+    // one outbound row with qty=N becomes N plotted points (qty=1 each).
+    let mut latest_plots_rev = Vec::with_capacity(6);
+    for ev in raw_events.iter().rev() {
+        if latest_plots_rev.len() >= 6 {
+            break;
+        }
+        let n = parse_numeric_text(&ev.qty)
+            .map(|v| v.max(0.0).round() as usize)
+            .unwrap_or(1);
+        if n == 0 {
+            continue;
+        }
+        let take = n.min(6 - latest_plots_rev.len());
+        for _ in 0..take {
+            latest_plots_rev.push(ReplacementEvent {
+                date_iso: ev.date_iso.clone(),
+                qty: "1".to_string(),
+                host: ev.host.clone(),
+                row_idx: ev.row_idx,
+            });
+        }
+    }
+    latest_plots_rev.reverse();
+    latest_plots_rev
+}
+
 fn pick_first_col(columns: &HashMap<String, String>, keys: &[&str]) -> String {
+    // 1) exact key match
     for key in keys {
         if let Some(v) = columns.get(*key) {
             let t = v.trim();
@@ -1069,6 +1498,22 @@ fn pick_first_col(columns: &HashMap<String, String>, keys: &[&str]) -> String {
             }
         }
     }
+
+    // 2) normalized key match (handles line-breaks/spaces/nbsp in Excel headers)
+    let norm_aliases = keys
+        .iter()
+        .map(|k| normalize_header_key(k))
+        .collect::<Vec<_>>();
+    for (k, v) in columns {
+        let nk = normalize_header_key(k);
+        if norm_aliases.iter().any(|a| a == &nk) {
+            let t = v.trim();
+            if !t.is_empty() {
+                return t.to_string();
+            }
+        }
+    }
+
     "기록없음".to_string()
 }
 
@@ -1076,6 +1521,160 @@ fn fallback_missing_doc(v: Option<String>) -> String {
     v.map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "기록없음".to_string())
+}
+
+fn parse_numeric_text(raw: &str) -> Option<f64> {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+        .collect();
+    if cleaned.is_empty() || cleaned == "-" || cleaned == "." {
+        return None;
+    }
+    cleaned.parse::<f64>().ok()
+}
+
+fn decide_purchase_legacy(current_stock_updated: f64) -> PurchaseDecision {
+    if current_stock_updated <= 0.0 {
+        PurchaseDecision {
+            should_purchase: true,
+            note: "재고 부족 가능성 확인 후 구매발주 검토".to_string(),
+            template_kind: PurchaseTemplateKind::Over500k,
+        }
+    } else {
+        PurchaseDecision {
+            should_purchase: true,
+            note: "현재 재고 유지".to_string(),
+            template_kind: PurchaseTemplateKind::Over500k,
+        }
+    }
+}
+
+fn is_missing_doc_value(v: &str) -> bool {
+    let t = v.trim();
+    t.is_empty() || matches!(t, "기록없음" | "출고기록없음" | "입고기록없음")
+}
+
+fn decide_purchase_v2(
+    required_stock: Option<f64>,
+    current_stock: f64,
+    unit_price: Option<f64>,
+) -> PurchaseDecision {
+    let Some(req) = required_stock else {
+        return PurchaseDecision {
+            should_purchase: false,
+            note: "구매 제외: 필수재고량 데이터 없음".to_string(),
+            template_kind: PurchaseTemplateKind::UnderEq500k,
+        };
+    };
+
+    if req <= 0.0 {
+        return PurchaseDecision {
+            should_purchase: false,
+            note: "구매 제외: 필수재고량이 0 이하".to_string(),
+            template_kind: PurchaseTemplateKind::UnderEq500k,
+        };
+    }
+
+    if current_stock >= req {
+        return PurchaseDecision {
+            should_purchase: false,
+            note: "구매 제외: 현재고가 필수재고량 이상".to_string(),
+            template_kind: PurchaseTemplateKind::UnderEq500k,
+        };
+    }
+
+    if current_stock > req * 0.3 {
+        return PurchaseDecision {
+            should_purchase: false,
+            note: "구매 제외: 현재고가 필수재고량의 30% 초과".to_string(),
+            template_kind: PurchaseTemplateKind::UnderEq500k,
+        };
+    }
+
+    let price = unit_price.unwrap_or(0.0);
+    if price >= 500_000.0 {
+        PurchaseDecision {
+            should_purchase: true,
+            note: "구매 진행: 과거 단가 50만원 이상 -> 부품 구매 요청 품의".to_string(),
+            template_kind: PurchaseTemplateKind::Over500k,
+        }
+    } else {
+        PurchaseDecision {
+            should_purchase: true,
+            note: "구매 진행: 과거 단가 50만원 이하 -> 부품 구매 품의".to_string(),
+            template_kind: PurchaseTemplateKind::UnderEq500k,
+        }
+    }
+}
+
+fn load_part_role_index(input_dir: &Path) -> Result<Option<PartRoleIndex>> {
+    let candidates = [
+        input_dir.join("Part_function.json"),
+        input_dir.join("part_function.json"),
+        input_dir.join("part-role.json"),
+        input_dir.join("part_role.json"),
+    ];
+
+    let source = candidates.into_iter().find(|p| p.exists());
+    let Some(path) = source else {
+        return Ok(None);
+    };
+
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("read part role json failed: {}", path.display()))?;
+
+    let records: Vec<PartFunctionRecord> = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => {
+            let names: Vec<String> = regex::Regex::new(r#""item_name"\s*:\s*"([^"]*)""#)
+                .ok()
+                .map(|re| {
+                    re.captures_iter(&raw)
+                        .filter_map(|c| c.get(1).map(|m| m.as_str().to_string()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let descs: Vec<String> = regex::Regex::new(r#""description"\s*:\s*"([^"]*)""#)
+                .ok()
+                .map(|re| {
+                    re.captures_iter(&raw)
+                        .filter_map(|c| c.get(1).map(|m| m.as_str().to_string()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            let size = names.len().min(descs.len());
+            let mut out = Vec::with_capacity(size);
+            for i in 0..size {
+                out.push(PartFunctionRecord {
+                    item_name: names[i].clone(),
+                    description: descs[i].clone(),
+                });
+            }
+            out
+        }
+    };
+
+    if records.is_empty() {
+        return Ok(None);
+    }
+
+    let mut index = PartRoleIndex::default();
+    for r in records {
+        let name = r.item_name.trim();
+        let role = r.description.trim();
+        if name.is_empty() || role.is_empty() {
+            continue;
+        }
+        index.insert(name, role);
+    }
+
+    if index.items.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(index))
 }
 
 fn load_template_package(template: &Path) -> Result<TemplatePackage> {
@@ -1142,22 +1741,21 @@ fn render_docx_from_package(
 
 fn patch_document_xml_docx(xml: &str, row: &DocumentRow, serial: usize) -> String {
     let values = build_docx_values(row, serial);
-    patch_paragraph_text_runs_docx(xml, &values)
+    let compacted = prune_empty_replacement_rows_docx(xml, &values);
+    patch_paragraph_text_runs_docx(&compacted, &values)
 }
 
 fn patch_paragraph_text_runs_docx(xml: &str, values: &BTreeMap<&'static str, String>) -> String {
+    let ranges = find_tag_ranges_docx(xml, "w:p");
+    if ranges.is_empty() {
+        return xml.to_string();
+    }
+
     let mut out = String::with_capacity(xml.len() + 1024);
     let mut cursor = 0usize;
 
-    while let Some(p_start_rel) = xml[cursor..].find("<w:p") {
-        let p_start = cursor + p_start_rel;
+    for (p_start, p_end) in ranges {
         out.push_str(&xml[cursor..p_start]);
-
-        let Some(p_end_rel) = xml[p_start..].find("</w:p>") else {
-            out.push_str(&xml[p_start..]);
-            return out;
-        };
-        let p_end = p_start + p_end_rel + "</w:p>".len();
         let paragraph = &xml[p_start..p_end];
         out.push_str(&patch_one_paragraph_docx(paragraph, values));
         cursor = p_end;
@@ -1201,7 +1799,21 @@ fn find_text_slots_docx(xml: &str) -> Vec<(usize, usize)> {
     let mut cursor = 0usize;
 
     while let Some(t_start_rel) = xml[cursor..].find("<w:t") {
-        let t_start = cursor + t_start_rel;
+        let mut t_start = cursor + t_start_rel;
+        // Exact tag only: <w:t ...> or <w:t>, not <w:tc>, <w:tbl>, <w:tab>...
+        loop {
+            let next = xml[t_start + "<w:t".len()..].chars().next();
+            let is_exact = matches!(next, Some('>') | Some(' ') | Some('\t') | Some('\r') | Some('\n'));
+            if is_exact {
+                break;
+            }
+            let retry_from = t_start + 1;
+            let Some(next_rel) = xml[retry_from..].find("<w:t") else {
+                return slots;
+            };
+            t_start = retry_from + next_rel;
+        }
+
         let Some(gt_rel) = xml[t_start..].find('>') else {
             break;
         };
@@ -1241,61 +1853,178 @@ fn replace_tokens_in_text_docx(text: &str, values: &BTreeMap<&'static str, Strin
     out
 }
 
+fn prune_empty_replacement_rows_docx(xml: &str, values: &BTreeMap<&'static str, String>) -> String {
+    let row_ranges = find_tag_ranges_docx(xml, "w:tr");
+    if row_ranges.is_empty() {
+        return xml.to_string();
+    }
+
+    let token_re = match regex::Regex::new(r"\{\{\s*([^}]+?)\s*\}\}") {
+        Ok(v) => v,
+        Err(_) => return xml.to_string(),
+    };
+
+    let mut out = String::with_capacity(xml.len());
+    let mut cursor = 0usize;
+    for (start, end) in row_ranges {
+        out.push_str(&xml[cursor..start]);
+        let row_xml = &xml[start..end];
+        let plain = extract_plain_text_docx(row_xml);
+        let is_replacement_row =
+            plain.contains("{{날짜") || plain.contains("{{호기") || plain.contains("{{교체수량");
+
+        if !is_replacement_row {
+            out.push_str(row_xml);
+            cursor = end;
+            continue;
+        }
+
+        let mut keep = false;
+        for cap in token_re.captures_iter(&plain) {
+            let Some(m) = cap.get(1) else {
+                continue;
+            };
+            let key = m.as_str().trim();
+            if let Some(v) = values.get(key) {
+                if !v.trim().is_empty() {
+                    keep = true;
+                    break;
+                }
+            }
+        }
+
+        if keep {
+            out.push_str(row_xml);
+        }
+        cursor = end;
+    }
+
+    out.push_str(&xml[cursor..]);
+    out
+}
+
+fn extract_plain_text_docx(xml: &str) -> String {
+    let slots = find_text_slots_docx(xml);
+    if slots.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for (s, e) in slots {
+        out.push_str(&xml_unescape_docx(&xml[s..e]));
+    }
+    out
+}
+
+fn find_tag_ranges_docx(xml: &str, tag: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let start_pat = format!("<{tag}");
+    let end_pat = format!("</{tag}>");
+    let mut cursor = 0usize;
+
+    while let Some(start_rel) = xml[cursor..].find(&start_pat) {
+        let mut start = cursor + start_rel;
+        // Ensure exact tag match: <w:tr ...> or <w:tr>, but not <w:trPr>.
+        loop {
+            let next = xml[start + start_pat.len()..].chars().next();
+            let is_exact = matches!(next, Some('>') | Some(' ') | Some('\t') | Some('\r') | Some('\n'));
+            if is_exact {
+                break;
+            }
+            let retry_from = start + 1;
+            let Some(next_rel) = xml[retry_from..].find(&start_pat) else {
+                return out;
+            };
+            start = retry_from + next_rel;
+        }
+
+        let Some(end_rel) = xml[start..].find(&end_pat) else {
+            break;
+        };
+        let end = start + end_rel + end_pat.len();
+        out.push((start, end));
+        cursor = end;
+    }
+    out
+}
+
 fn build_docx_values(row: &DocumentRow, serial: usize) -> BTreeMap<&'static str, String> {
-    let today = Local::now().format("%Y-%m-%d").to_string();
-    let issued_date = if row.issued_date.trim().is_empty() {
-        row.used_date_last.clone()
-    } else {
-        row.issued_date.clone()
-    };
-    let model = if row.model_name.trim().is_empty() {
-        "(직접입력)".to_string()
-    } else {
-        row.model_name.clone()
-    };
-    let vendor = if row.vendor_name.trim().is_empty() {
+    let now = Local::now();
+    let today = now.format("%Y-%m-%d").to_string();
+    let doc_date = now.format("%Y%m%d").to_string();
+    let vendor = if is_missing_doc_value(&row.vendor_name) {
         "(직접입력)".to_string()
     } else {
         row.vendor_name.clone()
     };
-    let unit = if row.unit.trim().is_empty() {
+    let unit = if is_missing_doc_value(&row.unit) {
         "(직접입력)".to_string()
     } else {
         row.unit.clone()
     };
-    let purchase_qty = if row.current_stock_updated <= 0.0 {
-        format!("{:.0}", row.outbound_qty_sum.max(1.0))
+    let purchase_reason = build_purchase_reason_text(row);
+    let target_where = if is_missing_doc_value(&row.used_where) {
+        "(직접입력)".to_string()
     } else {
-        "0".to_string()
+        row.used_where.clone()
     };
-    let replacement_qty = format!("{:.0}", row.outbound_qty_sum);
-
+    let purchase_qty = format!("{:.0}", row.purchase_qty.max(1.0));
+    let purchase_qty_num = row.purchase_qty.max(1.0);
+    let unit_price_num = parse_numeric_text(&row.unit_price);
+    let unit_price_text = unit_price_num
+        .map(|n| format_price_docx(&format!("{:.2}", n)))
+        .unwrap_or_else(|| "(직접입력)".to_string());
+    let supply_amount_text = unit_price_num
+        .map(|p| format_price_docx(&format!("{:.2}", p * purchase_qty_num)))
+        .unwrap_or_else(|| "(직접입력)".to_string());
     let mut m = BTreeMap::new();
     m.insert("번호", row.part_no.clone());
-    m.insert("문서번호", format!("DOC-{}-{:04}", Local::now().format("%Y%m%d"), serial));
+    m.insert("문서번호", format!("DOC-{}-{:04}", doc_date, serial));
     m.insert("작성일자", today.clone());
     m.insert("제목", format!("부품 구매 요청 - {} ({})", row.part_name, row.part_no));
     m.insert("품목", row.part_name.clone());
+    m.insert("부품명", row.part_name.clone());
+    m.insert("파트넘버", row.part_no.clone());
+    m.insert("장비범주", target_where.clone());
     m.insert("현재고", format!("{:.0}", row.current_stock_before));
+    m.insert("재고", format!("{:.0}", row.current_stock_before));
     m.insert("구매량", purchase_qty);
-    m.insert("교체수량1", replacement_qty.clone());
-    m.insert("교체수량2", replacement_qty);
-    m.insert("날짜1", issued_date.clone());
-    m.insert("날짜2", issued_date);
-    m.insert("대상장비", row.used_where.clone());
-    m.insert("호기1", row.equipment_no.clone());
-    m.insert("호기2", model);
+    m.insert("구매수량", format!("{:.0}", purchase_qty_num));
+    m.insert("교체수량1", row.replacement_qtys[0].clone());
+    m.insert("교체수량2", row.replacement_qtys[1].clone());
+    m.insert("교체수량3", row.replacement_qtys[2].clone());
+    m.insert("교체수량4", row.replacement_qtys[3].clone());
+    m.insert("교체수량5", row.replacement_qtys[4].clone());
+    m.insert("교체수량6", row.replacement_qtys[5].clone());
+    m.insert("날짜1", row.replacement_dates[0].clone());
+    m.insert("날짜2", row.replacement_dates[1].clone());
+    m.insert("날짜3", row.replacement_dates[2].clone());
+    m.insert("날짜4", row.replacement_dates[3].clone());
+    m.insert("날짜5", row.replacement_dates[4].clone());
+    m.insert("날짜6", row.replacement_dates[5].clone());
+    m.insert("대상장비", target_where);
+    m.insert("호기1", row.replacement_hosts[0].clone());
+    m.insert("호기2", row.replacement_hosts[1].clone());
+    m.insert("호기3", row.replacement_hosts[2].clone());
+    m.insert("호기4", row.replacement_hosts[3].clone());
+    m.insert("호기5", row.replacement_hosts[4].clone());
+    m.insert("호기6", row.replacement_hosts[5].clone());
     m.insert("부품-장착-수량", row.issued_qty.clone());
     m.insert("단위", unit);
-    m.insert("사유", row.replacement_reason.clone());
+    m.insert("단가", unit_price_text.clone());
+    m.insert("사유", "(직접입력)".to_string());
     m.insert("비고", row.purchase_order_note.clone());
     m.insert("구-거래처", vendor);
+    let supplier = m
+        .get("구-거래처")
+        .cloned()
+        .unwrap_or_else(|| "(직접입력)".to_string());
+    m.insert("공급업체", supplier);
 
     m.insert("관련사진1", "(직접기입)".to_string());
     m.insert("관련사진2", "(직접기입)".to_string());
     m.insert("1번설명", "(직접입력)".to_string());
     m.insert("2번설명", "(직접입력)".to_string());
-    m.insert("부품-원리-및-역할", "(직접입력)".to_string());
+    m.insert("부품-원리-및-역할", row.part_role.clone());
     m.insert("ctc-승인시간", "(직접입력)".to_string());
     m.insert("ctc-승인여부", "(직접입력)".to_string());
     m.insert("moz-승인시간", "(직접입력)".to_string());
@@ -1306,7 +2035,7 @@ fn build_docx_values(row: &DocumentRow, serial: usize) -> BTreeMap<&'static str,
     m.insert("직책1", "(직접입력)".to_string());
     m.insert("직책2", "(직접입력)".to_string());
     m.insert("발신부서", "(직접입력)".to_string());
-    m.insert("현황-및-문제점-1)", "(직접입력)".to_string());
+    m.insert("현황-및-문제점-1)", purchase_reason.clone());
     m.insert("현황-및-문제점-2", "(직접입력)".to_string());
     m.insert("이후-진행사항", "(직접입력)".to_string());
     m.insert("납기기간", "(직접입력)".to_string());
@@ -1315,15 +2044,33 @@ fn build_docx_values(row: &DocumentRow, serial: usize) -> BTreeMap<&'static str,
     m.insert("새-거래처", "(직접입력)".to_string());
     m.insert("신단가", "(직접입력)".to_string());
     m.insert("공급액", "(직접입력)".to_string());
-    m.insert("합계", "(직접입력)".to_string());
-    m.insert("구단가", format_price_docx(&row.unit_price));
+    m.insert("공급가액", supply_amount_text.clone());
+    m.insert("공급가액합계", supply_amount_text.clone());
+    m.insert("합계", supply_amount_text);
+    m.insert("구단가", unit_price_text);
     m.insert("지급조건", "(직접입력)".to_string());
     m.insert("사용일", row.used_date_last.clone());
     m.insert("입고일", row.received_date.clone());
     m.insert("사용처", row.used_where.clone());
-    m.insert("문제점", row.usage_reason.clone());
+    m.insert("문제점", "(직접입력)".to_string());
     m.insert("파트키", row.part_key.clone());
     m
+}
+
+fn build_purchase_reason_text(row: &DocumentRow) -> String {
+    let req = row.required_stock.unwrap_or(0.0).max(0.0);
+    let cur = row.current_stock_before.max(0.0);
+    if req > 0.0 {
+        format!(
+            "해당 부품은 {} 부품으로서 필수재고 {:.0}개 중, 현재고 {:.0}개로 재고확보를 위한 부품 구매 신청",
+            row.part_name, req, cur
+        )
+    } else {
+        format!(
+            "해당 부품은 {} 부품으로서 현재고 {:.0}개로 재고확보를 위한 부품 구매 신청",
+            row.part_name, cur
+        )
+    }
 }
 
 fn xml_escape_docx(v: &str) -> String {
@@ -1392,27 +2139,36 @@ fn sanitize_docx_filename(s: &str) -> String {
     }
 }
 
-fn build_unique_docx_targets(outdir: &Path, rows: &[DocumentRow]) -> Vec<PathBuf> {
-    let mut reserved: HashSet<String> = HashSet::new();
-    if let Ok(rd) = fs::read_dir(outdir) {
-        for ent in rd.flatten() {
-            if let Some(name) = ent.file_name().to_str() {
-                reserved.insert(canonical_filename_key(name));
-            }
-        }
-    }
+fn build_unique_docx_targets_by_group(outdir: &Path, rows: &[DocumentRow]) -> Vec<PathBuf> {
+    let over_dir_yes = outdir.join("over_500k").join("history_yes");
+    let over_dir_no = outdir.join("over_500k").join("history_no");
+    let under_dir = outdir.join("under_eq_500k");
 
+    let mut reserved_over_yes = load_reserved_filenames(&over_dir_yes);
+    let mut reserved_over_no = load_reserved_filenames(&over_dir_no);
+    let mut reserved_under = load_reserved_filenames(&under_dir);
     let mut out = Vec::with_capacity(rows.len());
 
     for (idx, row) in rows.iter().enumerate() {
+        let (target_dir, reserved) = match row.template_kind {
+            PurchaseTemplateKind::Over500k => {
+                if row.has_replacement_history {
+                    (&over_dir_yes, &mut reserved_over_yes)
+                } else {
+                    (&over_dir_no, &mut reserved_over_no)
+                }
+            }
+            PurchaseTemplateKind::UnderEq500k => {
+                (&under_dir, &mut reserved_under)
+            }
+        };
+
         let base = sanitize_docx_filename(&row.part_name);
         let part_no = sanitize_docx_filename(&row.part_no);
-        let key = format!("기안문_({})", base);
+        // Include part_no by default to prevent wrong-doc selection when names duplicate.
+        let key = format!("기안문_({})_{}", base, part_no);
 
         let mut cand = format!("{key}.docx");
-        if reserved.contains(&canonical_filename_key(&cand)) {
-            cand = format!("{key}_{}.docx", part_no);
-        }
         if reserved.contains(&canonical_filename_key(&cand)) {
             cand = format!("{key}_{:04}.docx", idx + 1);
         }
@@ -1424,11 +2180,22 @@ fn build_unique_docx_targets(outdir: &Path, rows: &[DocumentRow]) -> Vec<PathBuf
         }
 
         reserved.insert(canonical_filename_key(&cand));
-        let fname = cand;
-        out.push(outdir.join(fname));
+        out.push(target_dir.join(cand));
     }
 
     out
+}
+
+fn load_reserved_filenames(dir: &Path) -> HashSet<String> {
+    let mut reserved = HashSet::new();
+    if let Ok(rd) = fs::read_dir(dir) {
+        for ent in rd.flatten() {
+            if let Some(name) = ent.file_name().to_str() {
+                reserved.insert(canonical_filename_key(name));
+            }
+        }
+    }
+    reserved
 }
 
 fn canonical_filename_key(name: &str) -> String {
@@ -1500,10 +2267,12 @@ fn write_batch_report(workspace: &Workspace, stamp: &str, report: &BatchReport) 
     fs::create_dir_all(&workspace.reports)
         .with_context(|| format!("create report dir failed: {}", workspace.reports.display()))?;
     let report_path = workspace.reports.join(format!("batch_report_{stamp}.json"));
-    let mut f = File::create(&report_path)
+    let f = File::create(&report_path)
         .with_context(|| format!("report file create failed: {}", report_path.display()))?;
-    serde_json::to_writer_pretty(&mut f, report).context("write batch report failed")?;
-    writeln!(&mut f).ok();
+    let mut w = BufWriter::new(f);
+    serde_json::to_writer_pretty(&mut w, report).context("write batch report failed")?;
+    writeln!(&mut w).ok();
+    w.flush().ok();
     Ok(report_path)
 }
 
@@ -1634,25 +2403,25 @@ fn read_inbound(path: &Path) -> Result<Vec<RowRecord>> {
         .unwrap_or("")
         .to_string();
 
-    let mut out = Vec::new();
-    for row in rows.into_iter().skip(1) {
-        if row.iter().all(|c| matches!(c, Data::Empty)) {
-            continue;
-        }
-        let date_raw = get_str_at(row, date_idx);
-        let date_iso = date_raw
-            .as_deref()
-            .and_then(normalize_date_to_iso);
-        out.push(RowRecord {
-            columns: extract_row_columns(row, &header),
-            part_no: get_str_at(row, part_no_idx),
-            part_name: get_str_at(row, part_name_idx),
-            qty: get_f64_at(row, qty_idx),
-            date: date_raw,
-            date_iso,
-            source_file: source_file.clone(),
-        });
-    }
+    let out = rows[1..]
+        .par_iter()
+        .filter_map(|row| {
+            if !is_effective_row(row) {
+                return None;
+            }
+            let date_raw = get_str_at(row, date_idx);
+            let date_iso = date_raw.as_deref().and_then(normalize_date_to_iso);
+            Some(RowRecord {
+                columns: extract_row_columns(row, &header),
+                part_no: get_str_at(row, part_no_idx),
+                part_name: get_str_at(row, part_name_idx),
+                qty: get_f64_at(row, qty_idx),
+                date: date_raw,
+                date_iso,
+                source_file: source_file.clone(),
+            })
+        })
+        .collect();
     Ok(out)
 }
 
@@ -1673,25 +2442,25 @@ fn read_outbound(path: &Path) -> Result<Vec<RowRecord>> {
         .unwrap_or("")
         .to_string();
 
-    let mut out = Vec::new();
-    for row in rows.into_iter().skip(1) {
-        if row.iter().all(|c| matches!(c, Data::Empty)) {
-            continue;
-        }
-        let date_raw = get_str_at(row, date_idx);
-        let date_iso = date_raw
-            .as_deref()
-            .and_then(normalize_date_to_iso);
-        out.push(RowRecord {
-            columns: extract_row_columns(row, &header),
-            part_no: get_str_at(row, part_no_idx),
-            part_name: get_str_at(row, part_name_idx),
-            qty: get_f64_at(row, qty_idx),
-            date: date_raw,
-            date_iso,
-            source_file: source_file.clone(),
-        });
-    }
+    let out = rows[1..]
+        .par_iter()
+        .filter_map(|row| {
+            if !is_effective_row(row) {
+                return None;
+            }
+            let date_raw = get_str_at(row, date_idx);
+            let date_iso = date_raw.as_deref().and_then(normalize_date_to_iso);
+            Some(RowRecord {
+                columns: extract_row_columns(row, &header),
+                part_no: get_str_at(row, part_no_idx),
+                part_name: get_str_at(row, part_name_idx),
+                qty: get_f64_at(row, qty_idx),
+                date: date_raw,
+                date_iso,
+                source_file: source_file.clone(),
+            })
+        })
+        .collect();
     Ok(out)
 }
 
@@ -1711,19 +2480,21 @@ fn read_stock(path: &Path) -> Result<Vec<StockRecord>> {
         .unwrap_or("")
         .to_string();
 
-    let mut out = Vec::new();
-    for row in rows.into_iter().skip(1) {
-        if row.iter().all(|c| matches!(c, Data::Empty)) {
-            continue;
-        }
-        out.push(StockRecord {
-            columns: extract_row_columns(row, &header),
-            part_no: get_str_at(row, part_no_idx),
-            part_name: get_str_at(row, part_name_idx),
-            stock_qty: get_f64_at(row, qty_idx),
-            source_file: source_file.clone(),
-        });
-    }
+    let out = rows[1..]
+        .par_iter()
+        .filter_map(|row| {
+            if !is_effective_row(row) {
+                return None;
+            }
+            Some(StockRecord {
+                columns: extract_row_columns(row, &header),
+                part_no: get_str_at(row, part_no_idx),
+                part_name: get_str_at(row, part_name_idx),
+                stock_qty: get_f64_at(row, qty_idx),
+                source_file: source_file.clone(),
+            })
+        })
+        .collect();
     Ok(out)
 }
 
@@ -1829,17 +2600,61 @@ fn normalize_date_to_iso(raw: &str) -> Option<String> {
         return None;
     }
 
+    if let Some(d) = fast_parse_date(trimmed) {
+        return Some(d.format("%Y-%m-%d").to_string());
+    }
+
     if let Ok(serial) = trimmed.parse::<f64>() {
         return excel_serial_to_iso(serial);
     }
 
-    for fmt in ["%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%-m/%-d/%Y", "%Y.%m.%d"] {
+    for fmt in DATE_PARSE_FORMATS {
         if let Ok(d) = NaiveDate::parse_from_str(trimmed, fmt) {
             return Some(d.format("%Y-%m-%d").to_string());
         }
     }
 
     None
+}
+
+fn fast_parse_date(s: &str) -> Option<NaiveDate> {
+    // Fast path for YYYY[-/.]MM[-/.]DD and M/D/YYYY
+    if s.len() == 10 {
+        let b = s.as_bytes();
+        let sep = b[4] as char;
+        if (sep == '-' || sep == '/' || sep == '.') && b[7] == b[4] {
+            let y = parse_u32_ascii(&s[0..4])?;
+            let m = parse_u32_ascii(&s[5..7])?;
+            let d = parse_u32_ascii(&s[8..10])?;
+            return NaiveDate::from_ymd_opt(y as i32, m, d);
+        }
+    }
+
+    if s.contains('/') {
+        let mut it = s.split('/');
+        let m = it.next()?;
+        let d = it.next()?;
+        let y = it.next()?;
+        if it.next().is_none()
+            && (1..=2).contains(&m.len())
+            && (1..=2).contains(&d.len())
+            && y.len() == 4
+        {
+            let y = parse_u32_ascii(y)?;
+            let m = parse_u32_ascii(m)?;
+            let d = parse_u32_ascii(d)?;
+            return NaiveDate::from_ymd_opt(y as i32, m, d);
+        }
+    }
+
+    None
+}
+
+fn parse_u32_ascii(s: &str) -> Option<u32> {
+    if s.is_empty() || !s.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    s.parse::<u32>().ok()
 }
 
 fn excel_serial_to_iso(serial: f64) -> Option<String> {

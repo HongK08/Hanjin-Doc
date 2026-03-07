@@ -20,13 +20,13 @@ const ENABLE_PURCHASE_DECISION_V2: bool = true;
 const DATE_PARSE_FORMATS: [&str; 5] = ["%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%-m/%-d/%Y", "%Y.%m.%d"];
 const TEMPLATE_DIR_NAME: &str = "문서제작양식";
 // 50만원 이상(>=) 템플릿(레거시): 부품 구매 요청 품의
-const TEMPLATE_OVER_500K_DOCX: &str = "한진_부품구매_요청_양식.docx";
+const TEMPLATE_OVER_500K_DOCX: &str = "부품구매_요청_양식.docx";
 // 50만원 이상(>=) + 교체이력 있음
 const TEMPLATE_OVER_500K_WITH_HISTORY_DOCX: &str = "부품구매요청_교체이럭_유.docx";
 // 50만원 이상(>=) + 교체이력 없음
 const TEMPLATE_OVER_500K_WITHOUT_HISTORY_DOCX: &str = "부품구매요청_교체이력_무.docx";
 // 50만원 이하(<) 템플릿(레거시): 부품 구매 품의
-const TEMPLATE_UNDER_EQ_500K_DOCX: &str = "한진_부품구매_양식.docx";
+const TEMPLATE_UNDER_EQ_500K_DOCX: &str = "부품구매_양식.docx";
 // 50만원 이하(<) + 교체이력 있음
 const TEMPLATE_UNDER_EQ_500K_WITH_HISTORY_DOCX: &str = "부품구매_교체이력_유.docx";
 // 50만원 이하(<) + 교체이력 없음
@@ -2782,6 +2782,7 @@ fn excel_serial_to_iso(serial: f64) -> Option<String> {
     let date = base.checked_add_signed(ChronoDuration::days(day))?;
     Some(date.format("%Y-%m-%d").to_string())
 }
+
 
 
 

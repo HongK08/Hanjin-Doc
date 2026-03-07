@@ -1,96 +1,74 @@
-﻿# Hanjin-Doc
+﻿# Doc Purchase Pipeline
 
-Excel(입고/재고/출고) 데이터를 읽어 통합 JSON 스냅샷을 만들고, DOCX 기안문을 자동 생성하는 Rust 배치 파이프라인입니다.
+Excel(입고/재고/출고) 데이터를 읽어 통합 스냅샷 JSON을 만들고, 구매 품의 DOCX를 생성하는 Rust 배치 앱입니다.
 
-## 1. 기술 스택
+## 기술 스택
 - Rust 2024
 - `calamine` (Excel 파싱)
-- `serde`, `serde_json` (데이터 직렬화)
+- `serde`, `serde_json` (직렬화)
 - `rayon` (병렬 처리)
-- `zip` (DOCX 템플릿 치환)
+- `zip` (DOCX 패키지/치환)
 - `chrono` (날짜/시간)
 
-## 2. 디렉토리 규칙 (상대경로)
-작업 루트는 기본 `./DB` 입니다.
+## 디렉토리
+기본 작업 루트는 `./DB`입니다.
 
 - `DB/input`: 입력 Excel + DOCX 템플릿
-- `DB/output`: 통합 JSON, 생성 DOCX, 스모크 결과
-- `DB/logs`: 배치 리포트/워크플로우 로그
+- `DB/output`: 결과 JSON + 생성 DOCX
+- `DB/logs`: 워크플로 로그 + 배치 리포트
 
-예시:
-```text
-app/
-  src/
-  DB/
-    input/
-    output/
-    logs/
-```
-
-## 3. 파이프라인
-1. `input`에서 최신 Excel 3종 탐지 (입고/재고/출고)
-2. 행 단위 raw 컬럼 보존 + 파트 키(`품명||부품번호`) 기준 집계
-3. `stock_in_out_monthly.json` 생성
-4. 문서 row 생성
-5. DOCX 템플릿 placeholder 치환 후 파일 생성
-6. 배치 로그/리포트 기록
-
-## 4. 실행 방법
-프로젝트 루트(`app`) 기준입니다.
-
-### 4.1 1회 배치 실행 (권장)
-```powershell
-cargo run --release --bin fin_rust_app -- --workdir ./DB --once
-```
-
-### 4.2 감시 모드 실행 (지속 루프)
-```powershell
-cargo run --release --bin fin_rust_app -- --workdir ./DB
-```
-
-### 4.3 1회 배치 + 스모크 출력 ON (선택)
-```powershell
-cargo run --release --bin fin_rust_app -- --workdir ./DB --once --smoke
-```
-
-### 4.4 레거시 모드 (파일 직접 지정)
-```powershell
-cargo run --release --bin fin_rust_app -- <inbound.xlsx> <stock.xlsx> <outbound.xlsx> <out.json>
-```
-
-## 5. 입력 파일 규칙
-- Excel 확장자: `.xlsx`, `.xlsm`, `.xls`
-- 파일명에서 종류 판별:
-  - `입고` 또는 `inbound` 포함 -> 입고
-  - `재고` 또는 `stock` 포함 -> 재고
-  - `출고` 또는 `outbound` 포함 -> 출고
-
-운영 시에는 각 종류별 최신 파일 1개씩 사용합니다.
-
-### DOCX 템플릿 파일명(고정)
-- `DB/input/한진_부품구매_요청_양식.docx` : 50만원 초과(>) 케이스
-- `DB/input/한진_부품구매_품의.docx` : 50만원 이하(<=) 케이스
+## 현재 동작 규칙
+1. `input`에서 최신 Excel 3종(입고/재고/출고)을 자동 선택
+2. `품명||부품번호` 키로 집계 후 `stock_in_out_monthly.json` 생성
+3. 구매 조건(활성화됨):
+ - `현재고 < 필수재고량`
+ - `현재고 <= 필수재고량의 30%`
+4. 단가 분기:
+ - `>= 500,000`: 구매 요청 품의 템플릿
+ - `< 500,000`: 구매 품의 템플릿
+5. 500K 이상 문서는 교체이력 유/무에 따라 템플릿 분기
+6. 교체이력은 수량 기반 플롯(출고 수량 `N` => 이력 `N`건)으로 반영
+7. DOCX 출력 폴더:
+ - `over_500k/history_yes`
+ - `over_500k/history_no`
+ - `under_eq_500k`
 
 참고:
-- 현재 코드 기본값은 구매결정 V2가 `OFF`라서 템플릿 분기 로직은 준비만 된 상태입니다.
+- 템플릿 파일명은 `src/main.rs` 상수(`TEMPLATE_*`)로 관리됩니다.
+- README에는 특정 회사명/브랜드명을 노출하지 않습니다.
 
-## 6. 주요 산출물
+## 실행
+프로젝트 루트(`app`) 기준:
+
+```powershell
+# 1회 실행
+cargo run --bin fin_rust_app -- --once
+
+# 감시 모드
+cargo run --bin fin_rust_app
+
+# 1회 + 스모크
+cargo run --bin fin_rust_app -- --once --smoke
+
+# 작업 루트 지정
+cargo run --bin fin_rust_app -- --workdir ./DB --once
+```
+
+레거시(직접 파일 지정):
+```powershell
+cargo run --bin fin_rust_app -- <inbound.xlsx> <stock.xlsx> <outbound.xlsx> <out.json>
+```
+
+## 산출물
 - `DB/output/stock_in_out_monthly.json`
-- `DB/output/<YYYY-MM-DD>/기안문_(부품명...).docx`
-- `DB/output/docx_smoke_test_*.txt` (`--smoke` 옵션 사용 시)
+- `DB/output/<YYYY-MM-DD>/...docx`
 - `DB/logs/workflow.log`
 - `DB/logs/batch_report_*.json`
 
-## 7. 성능/운영 메모
-- release 빌드 기준 사용 권장 (`--release`)
-- 중복 배치 방지를 위해 마지막 처리 fingerprint 기록
-- 파일 복사 중 상태 감지를 위해 안정성 체크 후 처리
-- `main.rs`에 일일 05:00 스케줄러 스켈레톤이 주석으로 포함되어 있어, 필요 시 활성화 가능
-
-## 8. Git 운영 정책
-이 저장소는 코드 전용으로 운영합니다.
-- 포함: `src`, `Cargo.toml`, `Cargo.lock`, `README.md`
-- 제외: `DB/**` (입력/출력/로그 산출물)
-
----
-문의/변경 요청은 이슈 또는 커밋 메시지 기준으로 반영합니다.
+## 운영 메모
+- 중복 배치 방지용 fingerprint: `DB/logs/last_batch_fingerprint.txt`
+- 수동 강제 재실행 시 해당 파일 삭제 후 `--once` 실행
+- 코드 변경 후 빠른 검증:
+```powershell
+cargo check --bin fin_rust_app
+```

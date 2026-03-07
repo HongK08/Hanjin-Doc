@@ -18,14 +18,19 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 // 현재는 기존 로직 유지 요청으로 비활성화 상태.
 const ENABLE_PURCHASE_DECISION_V2: bool = true;
 const DATE_PARSE_FORMATS: [&str; 5] = ["%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%-m/%-d/%Y", "%Y.%m.%d"];
+const TEMPLATE_DIR_NAME: &str = "문서제작양식";
 // 50만원 이상(>=) 템플릿(레거시): 부품 구매 요청 품의
 const TEMPLATE_OVER_500K_DOCX: &str = "한진_부품구매_요청_양식.docx";
 // 50만원 이상(>=) + 교체이력 있음
-const TEMPLATE_OVER_500K_WITH_HISTORY_DOCX: &str = "한진_부품구매요청_500K_초과_교체이력_유.docx";
+const TEMPLATE_OVER_500K_WITH_HISTORY_DOCX: &str = "부품구매요청_교체이럭_유.docx";
 // 50만원 이상(>=) + 교체이력 없음
-const TEMPLATE_OVER_500K_WITHOUT_HISTORY_DOCX: &str = "한진_부품구매요청_500K_초과_교체이력_무.docx";
-// 50만원 이하(<=) 템플릿: 부품 구매 품의
+const TEMPLATE_OVER_500K_WITHOUT_HISTORY_DOCX: &str = "부품구매요청_교체이력_무.docx";
+// 50만원 이하(<) 템플릿(레거시): 부품 구매 품의
 const TEMPLATE_UNDER_EQ_500K_DOCX: &str = "한진_부품구매_양식.docx";
+// 50만원 이하(<) + 교체이력 있음
+const TEMPLATE_UNDER_EQ_500K_WITH_HISTORY_DOCX: &str = "부품구매_교체이력_유.docx";
+// 50만원 이하(<) + 교체이력 없음
+const TEMPLATE_UNDER_EQ_500K_WITHOUT_HISTORY_DOCX: &str = "부품구매_교체이력_무.docx";
 
 #[derive(Debug)]
 struct AppConfig {
@@ -173,6 +178,7 @@ struct DocumentRow {
     replacement_qtys: [String; 6],
     replacement_hosts: [String; 6],
     vendor_name: String,
+    manufacturer_name: String,
     unit: String,
     unit_price: String,
     part_role: String,
@@ -385,10 +391,12 @@ struct TemplatePackage {
 struct NamedTemplatePackages {
     over_500k_with_history: Arc<TemplatePackage>,
     over_500k_without_history: Arc<TemplatePackage>,
-    under_eq_500k: Arc<TemplatePackage>,
+    under_eq_500k_with_history: Arc<TemplatePackage>,
+    under_eq_500k_without_history: Arc<TemplatePackage>,
     over_500k_with_history_name: String,
     over_500k_without_history_name: String,
-    under_eq_500k_name: String,
+    under_eq_500k_with_history_name: String,
+    under_eq_500k_without_history_name: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1119,7 +1127,8 @@ fn generate_docx_from_snapshot(
     for dir in [
         outdir.join("over_500k").join("history_yes"),
         outdir.join("over_500k").join("history_no"),
-        outdir.join("under_eq_500k"),
+        outdir.join("under_eq_500k").join("history_yes"),
+        outdir.join("under_eq_500k").join("history_no"),
     ] {
         fs::create_dir_all(&dir).with_context(|| format!("create dir failed: {}", dir.display()))?;
     }
@@ -1140,12 +1149,13 @@ fn generate_docx_from_snapshot(
     write_log(
         workspace,
         &format!(
-            "docx generated: count={}, outdir='{}', split_dirs='over_500k/history_yes,over_500k/history_no,under_eq_500k', templates='over_hist_yes:{}','over_hist_no:{}','under_eq:{}'",
+            "docx generated: count={}, outdir='{}', split_dirs='over_500k/history_yes,over_500k/history_no,under_eq_500k/history_yes,under_eq_500k/history_no', templates='over_hist_yes:{}','over_hist_no:{}','under_hist_yes:{}','under_hist_no:{}'",
             generated.load(Ordering::Relaxed),
             outdir.display(),
             templates.over_500k_with_history_name,
             templates.over_500k_without_history_name,
-            templates.under_eq_500k_name
+            templates.under_eq_500k_with_history_name,
+            templates.under_eq_500k_without_history_name
         ),
     );
 
@@ -1153,11 +1163,11 @@ fn generate_docx_from_snapshot(
 }
 
 fn resolve_docx_templates_by_name(workspace: &Workspace) -> Result<Option<NamedTemplatePackages>> {
+    let template_dir = workspace.input_dir.join(TEMPLATE_DIR_NAME);
+
     let over_500k_path = workspace.input_dir.join(TEMPLATE_OVER_500K_DOCX);
-    let over_500k_with_history_path = workspace.input_dir.join(TEMPLATE_OVER_500K_WITH_HISTORY_DOCX);
-    let over_500k_without_history_path = workspace
-        .input_dir
-        .join(TEMPLATE_OVER_500K_WITHOUT_HISTORY_DOCX);
+    let over_500k_with_history_path = template_dir.join(TEMPLATE_OVER_500K_WITH_HISTORY_DOCX);
+    let over_500k_without_history_path = template_dir.join(TEMPLATE_OVER_500K_WITHOUT_HISTORY_DOCX);
 
     let (over_500k_with_history_pkg, over_500k_with_history_name, over_500k_without_history_pkg, over_500k_without_history_name) =
         if over_500k_with_history_path.exists() && over_500k_without_history_path.exists() {
@@ -1187,32 +1197,54 @@ fn resolve_docx_templates_by_name(workspace: &Workspace) -> Result<Option<NamedT
         };
 
     let under_eq_500k_path = workspace.input_dir.join(TEMPLATE_UNDER_EQ_500K_DOCX);
-    let (under_eq_500k_pkg, under_eq_500k_name) = if under_eq_500k_path.exists() {
-        (
-            Arc::new(load_template_package(&under_eq_500k_path)?),
-            TEMPLATE_UNDER_EQ_500K_DOCX.to_string(),
-        )
-    } else {
-        write_log(
-            workspace,
-            &format!(
-                "approval template '{}' not found; fallback to 500k-over(no-history) template",
-                TEMPLATE_UNDER_EQ_500K_DOCX
-            ),
-        );
-        (
-            over_500k_without_history_pkg.clone(),
-            over_500k_without_history_name.clone(),
-        )
-    };
+    let under_eq_500k_with_history_path = template_dir.join(TEMPLATE_UNDER_EQ_500K_WITH_HISTORY_DOCX);
+    let under_eq_500k_without_history_path = template_dir.join(TEMPLATE_UNDER_EQ_500K_WITHOUT_HISTORY_DOCX);
+
+    let (under_eq_500k_with_history_pkg, under_eq_500k_with_history_name, under_eq_500k_without_history_pkg, under_eq_500k_without_history_name) =
+        if under_eq_500k_with_history_path.exists() && under_eq_500k_without_history_path.exists() {
+            (
+                Arc::new(load_template_package(&under_eq_500k_with_history_path)?),
+                TEMPLATE_UNDER_EQ_500K_WITH_HISTORY_DOCX.to_string(),
+                Arc::new(load_template_package(&under_eq_500k_without_history_path)?),
+                TEMPLATE_UNDER_EQ_500K_WITHOUT_HISTORY_DOCX.to_string(),
+            )
+        } else if under_eq_500k_path.exists() {
+            write_log(
+                workspace,
+                &format!(
+                    "500k under history templates not fully found; fallback to legacy template '{}'",
+                    TEMPLATE_UNDER_EQ_500K_DOCX
+                ),
+            );
+            let legacy = Arc::new(load_template_package(&under_eq_500k_path)?);
+            (
+                legacy.clone(),
+                TEMPLATE_UNDER_EQ_500K_DOCX.to_string(),
+                legacy,
+                TEMPLATE_UNDER_EQ_500K_DOCX.to_string(),
+            )
+        } else {
+            write_log(
+                workspace,
+                "500k under templates not found; fallback to 500k over(no-history) template",
+            );
+            (
+                over_500k_without_history_pkg.clone(),
+                over_500k_without_history_name.clone(),
+                over_500k_without_history_pkg.clone(),
+                over_500k_without_history_name.clone(),
+            )
+        };
 
     Ok(Some(NamedTemplatePackages {
         over_500k_with_history: over_500k_with_history_pkg,
         over_500k_without_history: over_500k_without_history_pkg,
-        under_eq_500k: under_eq_500k_pkg,
+        under_eq_500k_with_history: under_eq_500k_with_history_pkg,
+        under_eq_500k_without_history: under_eq_500k_without_history_pkg,
         over_500k_with_history_name,
         over_500k_without_history_name,
-        under_eq_500k_name,
+        under_eq_500k_with_history_name,
+        under_eq_500k_without_history_name,
     }))
 }
 
@@ -1225,7 +1257,13 @@ fn select_template_for_row<'a>(row: &DocumentRow, templates: &'a NamedTemplatePa
                 templates.over_500k_without_history.as_ref()
             }
         }
-        PurchaseTemplateKind::UnderEq500k => templates.under_eq_500k.as_ref(),
+        PurchaseTemplateKind::UnderEq500k => {
+            if row.has_replacement_history {
+                templates.under_eq_500k_with_history.as_ref()
+            } else {
+                templates.under_eq_500k_without_history.as_ref()
+            }
+        }
     }
 }
 
@@ -1288,6 +1326,7 @@ fn build_document_rows(
         ];
         let mut unit = "기록없음".to_string();
         let mut vendor_name = "기록없음".to_string();
+        let mut manufacturer_name = "기록없음".to_string();
         let mut unit_price = "기록없음".to_string();
 
         if let Some(out_idx) = part.outbound_row_idx.last() {
@@ -1335,6 +1374,7 @@ fn build_document_rows(
                 if v != "기록없음" {
                     vendor_name = v;
                 }
+
                 unit = pick_first_col(&in_row.columns, &["단위"]);
                 unit_price = pick_first_col(
                     &in_row.columns,
@@ -1358,6 +1398,18 @@ fn build_document_rows(
                     &row.columns,
                     &["납품업체", "납품업체명", "거래처", "업체", "공급업체", "구매업체"],
                 );
+            }
+            if is_missing_doc_value(&manufacturer_name) {
+                let m = pick_first_col(
+                    &row.columns,
+                    &[
+                        "주요Model명",
+                        "Model명",
+                        "부품제조사",
+                        "부품 제조사",
+                    ],
+                );
+                manufacturer_name = extract_manufacturer_name(&m);
             }
             if is_missing_doc_value(&unit) {
                 unit = pick_first_col(&row.columns, &["단위"]);
@@ -1410,6 +1462,7 @@ fn build_document_rows(
             replacement_qtys,
             replacement_hosts,
             vendor_name,
+            manufacturer_name,
             unit,
             unit_price,
             part_role,
@@ -1553,6 +1606,40 @@ fn decide_purchase_legacy(current_stock_updated: f64) -> PurchaseDecision {
 fn is_missing_doc_value(v: &str) -> bool {
     let t = v.trim();
     t.is_empty() || matches!(t, "기록없음" | "출고기록없음" | "입고기록없음")
+}
+
+fn is_plausible_manufacturer_token(token: &str) -> bool {
+    let t = token.trim();
+    if t.is_empty() {
+        return false;
+    }
+
+    let has_alpha = t.chars().any(|c| c.is_alphabetic());
+    let has_digit = t.chars().any(|c| c.is_ascii_digit());
+
+    has_alpha && !has_digit
+}
+
+fn extract_manufacturer_name(raw: &str) -> String {
+    if is_missing_doc_value(raw) {
+        return "기록없음".to_string();
+    }
+
+    let raw = raw.trim();
+    if is_plausible_manufacturer_token(raw) {
+        return raw.to_string();
+    }
+
+    for token in raw.split(|c: char| {
+        c.is_whitespace() || matches!(c, '/' | '\\' | '|' | ',' | ';' | '(' | ')' | '[' | ']')
+    }) {
+        let token = token.trim();
+        if is_plausible_manufacturer_token(token) {
+            return token.to_string();
+        }
+    }
+
+    "기록없음".to_string()
 }
 
 fn decide_purchase_v2(
@@ -1956,6 +2043,11 @@ fn build_docx_values(row: &DocumentRow, serial: usize) -> BTreeMap<&'static str,
     } else {
         row.vendor_name.clone()
     };
+    let manufacturer = if is_missing_doc_value(&row.manufacturer_name) {
+        "(직접입력)".to_string()
+    } else {
+        row.manufacturer_name.clone()
+    };
     let unit = if is_missing_doc_value(&row.unit) {
         "(직접입력)".to_string()
     } else {
@@ -1983,8 +2075,11 @@ fn build_docx_values(row: &DocumentRow, serial: usize) -> BTreeMap<&'static str,
     m.insert("제목", format!("부품 구매 요청 - {} ({})", row.part_name, row.part_no));
     m.insert("품목", row.part_name.clone());
     m.insert("부품명", row.part_name.clone());
+    m.insert("품번", row.part_no.clone());
     m.insert("파트넘버", row.part_no.clone());
     m.insert("장비범주", target_where.clone());
+    m.insert("장비", target_where.clone());
+    m.insert("장비명", target_where.clone());
     m.insert("현재고", format!("{:.0}", row.current_stock_before));
     m.insert("재고", format!("{:.0}", row.current_stock_before));
     m.insert("구매량", purchase_qty);
@@ -2012,8 +2107,11 @@ fn build_docx_values(row: &DocumentRow, serial: usize) -> BTreeMap<&'static str,
     m.insert("단위", unit);
     m.insert("단가", unit_price_text.clone());
     m.insert("사유", "(직접입력)".to_string());
-    m.insert("비고", row.purchase_order_note.clone());
-    m.insert("구-거래처", vendor);
+    m.insert("구매사유", purchase_reason.clone());
+    m.insert("비고", purchase_reason.clone());
+    m.insert("구-거래처", vendor.clone());
+    m.insert("구거래처", vendor.clone());
+    m.insert("부품제조사", manufacturer);
     let supplier = m
         .get("구-거래처")
         .cloned()
@@ -2025,6 +2123,7 @@ fn build_docx_values(row: &DocumentRow, serial: usize) -> BTreeMap<&'static str,
     m.insert("1번설명", "(직접입력)".to_string());
     m.insert("2번설명", "(직접입력)".to_string());
     m.insert("부품-원리-및-역할", row.part_role.clone());
+    m.insert("부품역할", row.part_role.clone());
     m.insert("ctc-승인시간", "(직접입력)".to_string());
     m.insert("ctc-승인여부", "(직접입력)".to_string());
     m.insert("moz-승인시간", "(직접입력)".to_string());
@@ -2049,6 +2148,13 @@ fn build_docx_values(row: &DocumentRow, serial: usize) -> BTreeMap<&'static str,
     m.insert("합계", supply_amount_text);
     m.insert("구단가", unit_price_text);
     m.insert("지급조건", "(직접입력)".to_string());
+    m.insert("교체일", row.replacement_dates[0].clone());
+    m.insert("교체일2", row.replacement_dates[1].clone());
+    m.insert("교체장비호기", row.replacement_hosts[0].clone());
+    m.insert("교체장비호기2", row.replacement_hosts[1].clone());
+    m.insert("총 교체수량", row.issued_qty.clone());
+    m.insert("교체내역 유무", if row.has_replacement_history { "유".to_string() } else { "무".to_string() });
+    m.insert("수리진행여부", "(직접입력)".to_string());
     m.insert("사용일", row.used_date_last.clone());
     m.insert("입고일", row.received_date.clone());
     m.insert("사용처", row.used_where.clone());
@@ -2062,7 +2168,7 @@ fn build_purchase_reason_text(row: &DocumentRow) -> String {
     let cur = row.current_stock_before.max(0.0);
     if req > 0.0 {
         format!(
-            "해당 부품은 {} 부품으로서 필수재고 {:.0}개 중, 현재고 {:.0}개로 재고확보를 위한 부품 구매 신청",
+            "해당 부품은 {}부품으로서 필수재고 {:.0}개중, 현재고 {:.0}개로 재고확보를 위한 부품 구매 신청",
             row.part_name, req, cur
         )
     } else {
@@ -2142,11 +2248,13 @@ fn sanitize_docx_filename(s: &str) -> String {
 fn build_unique_docx_targets_by_group(outdir: &Path, rows: &[DocumentRow]) -> Vec<PathBuf> {
     let over_dir_yes = outdir.join("over_500k").join("history_yes");
     let over_dir_no = outdir.join("over_500k").join("history_no");
-    let under_dir = outdir.join("under_eq_500k");
+    let under_dir_yes = outdir.join("under_eq_500k").join("history_yes");
+    let under_dir_no = outdir.join("under_eq_500k").join("history_no");
 
     let mut reserved_over_yes = load_reserved_filenames(&over_dir_yes);
     let mut reserved_over_no = load_reserved_filenames(&over_dir_no);
-    let mut reserved_under = load_reserved_filenames(&under_dir);
+    let mut reserved_under_yes = load_reserved_filenames(&under_dir_yes);
+    let mut reserved_under_no = load_reserved_filenames(&under_dir_no);
     let mut out = Vec::with_capacity(rows.len());
 
     for (idx, row) in rows.iter().enumerate() {
@@ -2159,7 +2267,11 @@ fn build_unique_docx_targets_by_group(outdir: &Path, rows: &[DocumentRow]) -> Ve
                 }
             }
             PurchaseTemplateKind::UnderEq500k => {
-                (&under_dir, &mut reserved_under)
+                if row.has_replacement_history {
+                    (&under_dir_yes, &mut reserved_under_yes)
+                } else {
+                    (&under_dir_no, &mut reserved_under_no)
+                }
             }
         };
 
@@ -2215,6 +2327,7 @@ fn format_price_docx(input: &str) -> String {
     if !int_part.chars().all(|c| c.is_ascii_digit()) {
         return input.to_string();
     }
+
     let mut grouped_rev = String::with_capacity(int_part.len() + (int_part.len() / 3));
     for (i, ch) in int_part.chars().rev().enumerate() {
         if i > 0 && i % 3 == 0 {
@@ -2223,12 +2336,15 @@ fn format_price_docx(input: &str) -> String {
         grouped_rev.push(ch);
     }
     let mut grouped: String = grouped_rev.chars().rev().collect();
+
     if let Some(frac) = frac_part {
-        if !frac.is_empty() {
+        let frac_trimmed = frac.trim_end_matches('0');
+        if !frac_trimmed.is_empty() {
             grouped.push('.');
-            grouped.push_str(frac);
+            grouped.push_str(frac_trimmed);
         }
     }
+
     if negative {
         format!("-{}", grouped)
     } else {
@@ -2666,3 +2782,14 @@ fn excel_serial_to_iso(serial: f64) -> Option<String> {
     let date = base.checked_add_signed(ChronoDuration::days(day))?;
     Some(date.format("%Y-%m-%d").to_string())
 }
+
+
+
+
+
+
+
+
+
+
+
